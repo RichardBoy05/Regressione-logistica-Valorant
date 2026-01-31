@@ -1,0 +1,1606 @@
+---
+title: "Report statistico sul dataset **Valorant**"
+author: "<div class=\"custom-author-box\">\n<span class=\"group-label\">Gruppo:</span>\n<span
+  class=\"group-name\">Tianwen</span>\n<ul>\n  <li>**Berardi Francesco** (n. 1099783)</li>\n
+  \ <li>**Meoli Richard** (n. 1099274)</li>\n  <li>**Noris Francesco** (n. 1100339)</li>\n
+  \ <li>**Pullano Gabriele** (n. 1099559)</li>\n</ul>\n</div>\n"
+date: "*Dicembre 2025 - Gennaio 2026*"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    highlight: espresso
+    number_sections: true
+  pdf_document:
+    toc: true
+subtitle: Università degli Studi di Bergamo | Ingegneria Informatica | Corso di Statistica
+---
+
+```{r setup, include=FALSE}
+
+# parametri globali dei chunk
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+
+# librerie per analisi statistiche e manipolazione dei dati (CITATE insieme ad R nella bibliografia)
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(car)
+library(boot)
+library(pROC)
+library(broom)
+
+# librerie per grafici, layout e formattazione (NON CITATE nella bibliografia)
+library(kableExtra)
+library(scales)
+library(ggcorrplot)
+library(patchwork)
+library(gridExtra)
+```
+
+## **Obiettivo dell'analisi**
+
+In un ecosistema tattico complesso come quello di *Valorant*, il successo di un team può essere ricondotto a due "*filosofie*" contrapposte: la capacità di un singolo fuoriclasse di "trascinare" i compagni (il cosiddetto *carry*) o la solidità di un collettivo ben coordinato. Il presente studio si propone di indagare i determinanti della vittoria nel contesto del *Valorant Champions Tour 2024*, cercando di quantificare statisticamente il peso di queste due dimensioni. Attraverso l'applicazione di un modello di **regressione logistica**, l’analisi mira a rispondere alla seguente domanda: la probabilità di successo è predetta meglio dal **talento individuale** dei singoli giocatori o da metriche che riflettono la **coesione e il supporto reciproco** all'interno del team?
+
+## **Preparazione dei dati**
+
+```{r loading-data}
+df_valorant <- read.csv("merge_data_valorant.csv")
+
+```
+
+### *Presentazione del dataset*
+Il dataset oggetto dello studio raccoglie le statistiche dettagliate dei match del *Valorant Champions Tour 2024*. Nella sua forma grezza, si presenta con un'estensione considerevole: comprende **`r format(nrow(df_valorant), big.mark = ".")` osservazioni** distribuite su **`r ncol(df_valorant)` variabili**.  Queste ultime documentano molteplici aspetti delle competizioni: dai metadati del torneo alle informazioni su team e giocatori, fino a specifici indicatori di performance tecnica. Tale mole di dati costituisce la base di partenza per la successiva fase di selezione e aggregazione, volta a isolare i fattori determinanti per il successo dei team.
+
+### *Missing values*
+
+``` {r missing-values}
+
+df_valorant[df_valorant == ""] <- NA # trasforma le celle vuote in valori di tipo NA per uniformità
+
+missing_count <- sum(!complete.cases(df_valorant))
+cols_with_na <- colSums(is.na(df_valorant))[colSums(is.na(df_valorant)) > 0]
+mean_kills_total <- mean(df_valorant$Kills, na.rm = TRUE)
+mean_kills_missing <- mean(df_valorant[!complete.cases(df_valorant), "Kills"], na.rm = TRUE)
+
+# rimozione e calcolo dellla nuova dimensione
+df_valorant <- na.omit(df_valorant)
+n_final <- nrow(df_valorant)
+```
+
+Durante l'analisi del dataset sono stati rilevati **`r missing_count` valori mancanti**, situati nelle colonne `Kill..Assist..Trade..Survive..` e `Headshot..`. Si è osservato che queste osservazioni presentano una media di `r round(mean_kills_missing, 1)` uccisioni, a fronte di una media generale di `r round(mean_kills_total, 1)`.
+Data l'incidenza irrilevante sul totale (*`r sprintf("%.5f", missing_count / nrow(df_valorant))` %*) e la natura del dato (l'assenza totale di *kills* suggerisce che i record siano riconducibili a *giocatori AFK* o a *bug* di sessione), si è proceduto alla **rimozione** delle righe (*listwise deletion*), riducendo a **`r format(n_final, big.mark = ".")`** il numero di osservazioni.
+
+### *Filtro delle osservazioni*
+
+```{r observations-filter}
+df_pulito <- df_valorant %>%
+  filter(Side == "both", Kill.Type == "All Kills")
+
+```
+
+Al fine di rimuovere le ridondanze strutturali, il dataset è stato filtrato secondo due criteri:
+
+* **Fase di gioco (`Side`):** il dataset originale registra separatamente le statistiche per le fasi di attacco e difesa. Si è scelto di isolare unicamente la modalità **"both"**, che offre una panoramica della performance dell'intero match, evitando di frammentare i dati per lo stesso evento.
+* **Modalità di uccisione (`Kill.Type`):** sono state rimosse le osservazioni relative a tipologie di eventi parziali (es. *First Kills*), mantenendo esclusivamente la categoria **"All Kills"**. Ciò garantisce che gli indici di performance (come il *Rating*) siano calcolati sulla totalità delle azioni di gioco, eliminando duplicati informativi e garantendo omogeneità nelle metriche di performance.
+
+A seguito di questa selezione, il dataset analizzato si riduce a un totale di **`r format(nrow(df_pulito), big.mark = ".")` osservazioni**.
+
+### *Scrematura delle variabili*
+
+```{r subsetting}
+vars_selezionate <- c(
+  "Rating", "Average.Combat.Score", "Kill..Assist..Trade..Survive..", "Assists",
+  "Kills", "Deaths", "Average.Damage.Per.Round", "Headshot..", "First.Kills", 
+  "First.Deaths", "Match.Name", "Map", "Player.Team", "Player", 
+  "Team.A.Score", "Team.B.Score"
+)
+
+# creazione del dataset ridotto
+df_ridotto <- df_pulito[, vars_selezionate]
+
+# aggiunta della variabile Win
+df_ridotto <- df_ridotto %>%
+  mutate(Win = ifelse(Team.A.Score > Team.B.Score, 1, 0))
+
+```
+
+Dopo aver applicato i filtri sulle osservazioni, si è proceduto alla selezione delle variabili ritenute utili in funzione dell'obiettivo dell'analisi. La seguente tabella illustra le scelte effettuate.
+
+```{r variables-table}
+
+dati_selezione <- data.frame(
+  Variabile = c(
+    "`Rating`, `Average.Combat.Score`",
+    "`Kills`, `Deaths`, `Headshot..`,`Average.Damage.Per.Round`",
+    "`First.Kills`, `First.Deaths`",
+    "`Kill..Assist..Trade..Survive..`, `Assists` ",
+    "`Match.Name`, `Map`, `Player.Team`, `Player`",
+    "`Team.A.Score`, `Team.B.Score` ",
+    "`Match.Result`",
+    "`Agents`",
+    "`Side`, `Kill.Type`, `Tournament`, `Stage`, `Match.Type`",
+    "`Enemy`, `Enemy.Team`, `Team.B`", 
+    "`Player.Kills`, `Enemy.Kills`, `Difference`, `Kills...Deaths..KD.`, `Kills...Deaths..FKD.` ",
+    "`Elimination`, `Detonated`, `Defused`, `Time.Expiry..No.Plant.`, `Eliminated`, `Defused.Failed`, `Detonation.Denied`, `Time.Expiry..Failed.to.Plant.` "
+  ),
+  Descrizione = c(
+    "Indici di performance individuale; quantificano l'efficacia tecnica complessiva.",
+    "Statistiche base di combattimento e precisione; conservate come indicatori primari dell'influenza del singolo.",
+    "Eventi di apertura; indicano la capacità di creare un vantaggio numerico iniziale.",
+    "Metriche di partecipazione e supporto; incluse per valutare il livello di sinergia e contributo al collettivo.",
+    "Chiavi di gestione; necessarie per isolare record univoci ed evitare duplicati.",
+    "Punteggi dei team; essenziali per derivare la variabile risposta binaria Win.",
+    "Stringa ridondante; sostituita dal calcolo diretto sui punteggi dei team.",
+    "Variabile tattica esclusa poiché non aggregabile a livello di squadra.",
+    "Parametri di filtraggio o metadati; esclusi poiché risultano costanti o privi di informazioni.",
+    "Dati avversari; rimossi per un focus esclusivo sulle metriche della squadra.",
+    "Statistiche dei duelli diretti o rapporti derivati; rimosse in quanto semplici rielaborazioni matematiche di variabili già presenti o dettagli troppo granulari ai fini dell'analisi.",
+    "Modalità di conclusione del round. Rimosse in quanto costituiscono una mera scomposizione aritmetica del punteggio finale: includerle significherebbe descrivere l'esito attraverso le sue componenti formali anziché spiegarlo tramite le metriche di performance."
+  ),
+  Stato = c(rep("TENUTA", 6), rep("SCARTATA", 6)) 
+)
+
+righe_tenute <- which(dati_selezione$Stato == "TENUTA")
+righe_scartate <- which(dati_selezione$Stato == "SCARTATA")
+dati_finali <- dati_selezione[, c("Variabile", "Descrizione")]
+
+# colori generici
+col_header_bg <- "#2c3e50"
+col_border_out <- "#333333"
+col_border_in  <- "#cccccc"
+
+# colori per righe tenute
+col_bg_keep <- "#eafaf1"
+col_tx_keep <- "#27ae60"
+
+# colori per righe scartate
+col_bg_drop <- "#fdedec"
+col_tx_drop <- "#c0392b"
+
+# generazione della tabella
+kbl(dati_finali, col.names = c("Variabile/i", "Descrizione e motivazione"), escape = FALSE) %>%
+  kable_styling(bootstrap_options = c("hover", "condensed"), 
+                full_width = TRUE, 
+                font_size = 14,
+                html_font = "Segoe UI") %>%
+  
+  row_spec(0, bold = TRUE, color = "white", background = col_header_bg, 
+           extra_css = paste0("border-top: 2px solid ", col_border_out, "; ",
+                              "border-bottom: 2px solid ", col_border_out, "; ",
+                              "border-left: 2px solid ", col_border_out, "; ",
+                              "border-right: 2px solid ", col_border_out, ";")) %>%
+  
+  row_spec(righe_tenute, background = col_bg_keep, color = col_tx_keep, 
+           extra_css = paste0("border-bottom: 1px solid ", col_border_in, ";")) %>%
+
+  row_spec(righe_scartate, background = col_bg_drop, color = col_tx_drop, 
+           extra_css = paste0("border-bottom: 1px solid ", col_border_in, ";")) %>%
+  
+  row_spec(nrow(dati_finali), 
+           extra_css = paste0("border-bottom: 2px solid ", col_border_out, ";")) %>%
+
+  column_spec(1, width = "35%", bold = TRUE, 
+              extra_css = paste0("border-left: 2px solid ", col_border_out, "; ",
+                                 "border-right: 1px solid ", col_border_in, "; vertical-align: middle;")) %>%
+
+  column_spec(2, width = "65%", 
+              extra_css = paste0("border-right: 2px solid ", col_border_out, "; vertical-align: middle;"))
+```
+
+Subito dopo la selezione è stata generata la variabile risposta binaria **`Win`**, pilastro centrale dell'analisi. Tale variabile, ottenuta confrontando i punteggi `Team.A.Score` e `Team.B.Score`, assume valore **1** qualora il team di riferimento abbia totalizzato un punteggio superiore a quello avversario.
+In conclusione, il processo ha consentito di ricondurre il dataset a un totale di **`r ncol(df_ridotto)` variabili**.
+
+
+### *Aggregazione dei dati per Team*
+
+```{r team-aggregation}
+
+df_team <- df_ridotto %>%
+  
+  # filtra per rendere univoche le righe dove la combinazione di match, mappa, team e giocatore è identica
+  distinct(Match.Name, Map, Player.Team, Player, .keep_all = TRUE) %>%
+  
+  # raggruppa per le chiavi che identificano la singola partita in una mappa del match
+  group_by(Match.Name, Map, Player.Team) %>%
+  summarise(
+    
+    # prendiamo la variabile Win (già creata sopra)
+    Win = first(Win),
+    
+    # MEDIE: convertiamo le percentuali in numeri direttamente qui per evitare gli NA
+    KAST_Mean = mean(as.numeric(gsub("%", "", Kill..Assist..Trade..Survive..))/100, na.rm = TRUE),
+    HS_Mean   = mean(as.numeric(gsub("%", "", Headshot..))/100, na.rm = TRUE),
+    
+    # altre MEDIE (già numeriche)
+    Rating_Mean = mean(Rating, na.rm = TRUE),
+    ACS_Mean    = mean(Average.Combat.Score, na.rm = TRUE),
+    ADR_Mean    = mean(Average.Damage.Per.Round, na.rm = TRUE),
+    
+    # SOMME (totali di squadra)
+    Kills_Tot       = sum(Kills, na.rm = TRUE),
+    Deaths_Tot      = sum(Deaths, na.rm = TRUE),
+    Assists_Tot     = sum(Assists, na.rm = TRUE),
+    FirstKills_Tot  = sum(First.Kills, na.rm = TRUE),
+    FirstDeaths_Tot = sum(First.Deaths, na.rm = TRUE),
+    
+    .groups = 'drop'
+  )
+
+```
+
+L’operazione conclusiva della fase di preparazione consiste nella transizione dell’unità statistica dal "singolo giocatore" alla "**squadra**", al fine di allineare i dati all'obiettivo di ricerca. La ristrutturazione è stata articolata in 4 passaggi.
+
+1. **Risoluzione della ridondanza dei duelli**: il dataset originale registra la performance di ogni giocatore in relazione a ciascuno dei cinque avversari, quintuplicando di fatto le osservazioni. Attraverso l'operazione di `distinct()`, sono stati isolati i record univoci per ogni giocatore in ogni scontro, garantendo che gli indici globali di partita non venissero erroneamente moltiplicati in fase di calcolo.
+2. **Trattamento delle stringhe**: alcune variabili come `Kill..Assist..Trade..Survive..` e `Headshot..` erano originariamente codificate come stringhe di testo contenenti il simbolo di percentuale ('%'). Si è proceduto alla rimozione sintattica di tale simbolo e alla successiva conversione in valori numerici decimali, al fine di consentire il calcolo delle medie di squadra ed evitare la generazione di errori.
+3. **Definizione delle chiavi di aggregazione**: le osservazioni sono state raggruppate in base alle variabili `Match.Name` e `Map`. L'inclusione della mappa come chiave tecnica, sebbene non oggetto di studio diretto, è stata indispensabile per trattare ogni singola sfida come un'osservazione indipendente. Questa scelta ha permesso di evitare il collasso di interi match (spesso composti da più mappe) in un'unica riga.
+4. **Differenziazione tra medie e somme**: la sintesi delle performance è stata guidata dalla natura delle variabili. Per gli indici qualitativi (`KAST_mean`, `HS_mean`, `Rating_Mean`, `ACS_Mean`, `ADR_Mean`) è stata adottata la **media di squadra** per rappresentare il livello medio del collettivo. Per i volumi di gioco (`Kills_Tot`, `Deaths_Tot`, `Assists_Tot`, `FirstKills_Tot`,`FirstDeaths_Tot`), si è optato per la **somma totale**, così da catturare l'output complessivo prodotto dal team durante il match.
+
+Il risultato di questo processo è un dataset in cui ogni riga rappresenta univocamente la performance di una **squadra** in una determinata mappa, corredata dalla variabile risposta binaria `Win` derivata in precedenza. Si è infine proceduto alla rimozione delle variabili `Team.A.Score`, `Team.B.Score` e `Player`, divenute superflue. Il dataset consta ora di **`r nrow(df_team)` osservazioni** e **`r ncol(df_team)` variabili**. 
+
+
+## **Exploratory Data Analysis**
+
+```{r eda, message=FALSE, warning=FALSE, fig.width=16, fig.height=10, fig.align='center', out.width="100%"}
+
+# barplot
+g1 <- df_team %>%
+  mutate(Win_Label = factor(Win, levels = c(1, 0), labels = c("Vittoria", "Sconfitta"))) %>%
+  ggplot(aes(x = Win_Label, fill = Win_Label)) +
+  geom_bar(width = 0.55, alpha = 0.95) +
+  
+  geom_text(
+    stat = 'count', 
+    aes(label = paste0(after_stat(count), "\n(", round(after_stat(count)/sum(after_stat(count))*100, 1), "%)")),
+    vjust = -0.3, 
+    fontface = "bold", 
+    size = 6,
+    lineheight = 0.9,
+    color = "#34495e"
+  ) +
+  scale_fill_manual(values = c("Vittoria" = "#06d6a0", "Sconfitta" = "#ef476f")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.25))) +
+  labs(
+    title = "Esiti dei Match",
+    y = "Numero di Match",
+    x = NULL
+  ) +
+  theme_minimal(base_family = "sans", base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 22, hjust = 0.5, color = "#2c3e50", margin = margin(b=15)),
+    axis.text.x = element_text(face = "bold", size = 20, color = "#34495e", margin = margin(t = 5)),
+    axis.text.y = element_text(size = 19, color = "#7f8c8d"),
+    axis.title.y = element_text(size = 19, color = "#7f8c8d", margin = margin(r = 10)),
+    panel.grid.major.y = element_line(color = "#ecf0f1", linewidth = 0.5),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line.x = element_line(color = "#bdc3c7", linewidth = 0.5),
+    legend.position = "none"
+  )
+
+# matrice di correlazione
+corr_matrix <- df_team %>%
+  select(Rating_Mean, ACS_Mean, ADR_Mean, KAST_Mean, HS_Mean, 
+         Kills_Tot, Deaths_Tot, Assists_Tot, 
+         FirstKills_Tot, FirstDeaths_Tot) %>%
+  cor(use = "complete.obs")
+
+g2 <- ggcorrplot(
+    corr_matrix,
+    hc.order = TRUE, 
+    type = "lower",
+    lab = TRUE,
+    lab_size = 7,
+    outline.col = "white",
+    colors = c("#2A9D8F", "white", "#E46666"), 
+    title = "Matrice di Correlazione",
+    ggtheme = theme_minimal(base_size = 14)
+  ) +
+  labs(subtitle = NULL, x = NULL, y = NULL) +
+  theme(
+    plot.title = element_text(face = "bold", size = 22, hjust = 0.5, color = "#2c3e50", margin = margin(b=15)),
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 19, color = "#34495e"),
+    axis.text.y = element_text(size = 19, color = "#34495e"),
+    panel.grid = element_blank(),
+    legend.position = "none"
+  ) +
+  coord_fixed()
+
+g1 + g2 + 
+  plot_layout(widths = c(0.8, 2))
+
+```
+
+Il *grafico a barre* (sinistra) illustra la ripartizione degli esiti per il campione di `r nrow(df_team)` osservazioni, registrando **`r sum(df_team$Win == 1)`** vittorie e **`r sum(df_team$Win == 0)`** sconfitte (_`r round(mean(df_team$Win == 1) * 100, 1)` %  -  `r round(mean(df_team$Win == 0) * 100, 1)` %_). Sebbene si riscontri una lieve **asimmetria** nella distribuzione, le due classi risultano rappresentate in modo sufficientemente equilibrato. Tale bilanciamento assicura che il futuro modello di **regressione logistica** possa apprendere efficacemente le caratteristiche di entrambi i gruppi, evitando il rischio di distorsioni sistematiche verso la classe maggioritaria.
+
+L'analisi della *matrice di correlazione* (destra) evidenzia una marcata ridondanza informativa tra i principali indicatori di performance offensiva (**multicollinearità**). Si osserva una correlazione quasi perfetta tra `ADR_Mean` e `ACS_Mean` (**0.96**), e valori estremamente elevati tra questi e il `Rating_Mean`. Tali evidenze suggeriscono che queste variabili catturino la medesima dimensione del successo, prefigurando potenziali problemi di multicollinearità per il modello di regressione. Al contrario, la variabile relativa alla precisione (`HS_mean`) risulta quasi totalmente decorrelata dagli altri predittori, indicando che l'efficienza meccanica nel "*colpo alla testa*" non si traduce linearmente in volumi di danno o rating superiori.
+
+
+## **Data Engineering**
+```{r data-engineering}
+
+# estrazione di alcuni indici individuali da df_ridotto, che contiene ancora le informazioni suddivise per giocatori
+indici_extra <- df_ridotto %>%
+
+  distinct(Match.Name, Map, Player.Team, Player, .keep_all = TRUE) %>%
+  
+  group_by(Match.Name, Map, Player.Team) %>%
+  summarise(
+    Rating_Max      = max(Rating, na.rm = TRUE),
+    Rating_SD       = sd(Rating, na.rm = TRUE),
+    Max_Kills_Indiv = max(Kills, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# unione al dataset aggregato per team e calcolo di rapporti
+df_engineered <- df_team %>%
+  left_join(indici_extra, by = c("Match.Name", "Map", "Player.Team")) %>%
+  mutate(
+    
+    Kill_Concentration = Max_Kills_Indiv / Kills_Tot,
+    Assists_per_Kill   = Assists_Tot / Kills_Tot
+  ) %>%
+  # rimozione della colonna d'appoggio utilizzata per il calcolo
+  select(-Max_Kills_Indiv)
+
+```
+
+### *Creazione di nuovi indicatori*
+Per rispondere al quesito di ricerca e superare i limiti descrittivi delle semplici medie di squadra, sono stati ingegnerizzati quattro nuovi indicatori. Queste metriche mirano a catturare dimensioni della performance che altrimenti resterebbero latenti, offrendo una prospettiva più profonda sulla distribuzione del talento e sulla sinergia tattica.
+
+* **Rating Massimo (`Rating_Max`)**: rappresenta il valore di *Rating* più elevato all'interno del team. L'obiettivo è quantificare il peso del picco prestazionale individuale (il cosiddetto "fuoriclasse") nel determinare l'esito della partita.
+* **Disparità di Rating (`Rating_SD`)**: calcola la deviazione standard dei *Rating* dei cinque componenti della squadra. Questo indice misura la disparità interna: un valore elevato indica una squadra sbilanciata con forte divario tra i membri, mentre un valore basso suggerisce un contributo equilibrato di tutto il collettivo.
+* **Concentrazione di Kill (`Kill_Concentration`)**: definito come il rapporto tra le uccisioni del miglior marcatore e il totale delle uccisioni di squadra. Questo parametro permette di valutare quanto il peso offensivo del team sia delegato a un unico trascinatore rispetto a una distribuzione più omogenea delle eliminazioni.
+* **Rapporto Assist / Kill (`Assists_per_Kill`)**: rapporto tra il numero totale di assist e quello delle uccisioni di squadra. Funge da termometro della coordinazione tattica, indicando in che misura le eliminazioni siano frutto di un lavoro preparatorio collettivo piuttosto che di iniziative isolate.
+
+Con queste aggiunte, il dataset è ora caratterizzato da **`r format(nrow(df_engineered), big.mark = ".", decimal.mark = ",")` osservazioni** e **`r format(ncol(df_engineered))` variabili**.
+
+### *Analisi visiva degli indicatori*
+Al fine di analizzare l'utilità degli indici creati in relazione alla loro capacità di distinguere i due gruppi di interesse, si riportano di seguito i relativi *boxplot* comparativi.
+
+
+```{r data-engineering-graphs, fig.width=14, fig.height=10, out.width="100%", fig.align='center'}
+
+# creazione dei BOXPLOT per i nuovi indicatori integrati
+
+plot_box_minimal <- function(data, var_name, indicator_name) {
+  ggplot(data, aes(x = Win_Factor, y = .data[[var_name]], fill = Win_Factor)) +
+    geom_boxplot(
+      width = 0.7, 
+      alpha = 0.8, 
+      color = "#404040", 
+      outlier.size = 2.5, 
+      outlier.alpha = 0.8, 
+      outlier.color = "#404040"
+    ) +
+    
+    scale_fill_manual(values = c("Sconfitta" = "#E46666", "Vittoria" = "#2A9D8F")) +
+    labs(title = indicator_name, x = NULL, y = NULL) + 
+    theme_minimal(base_size = 16) +
+    theme(
+      plot.title = element_text(face = "bold", size = 18, hjust = 0.5, margin = margin(b = 15)),
+      axis.text.x = element_text(face = "bold", color = "black", size = 15),
+      axis.text.y = element_text(size = 14, color = "black"),
+      panel.border = element_rect(color = "gray70", fill = NA, linewidth = 1),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      plot.margin = margin(15, 15, 15, 15) 
+    ) +
+    coord_cartesian(clip = "off") 
+}
+
+{
+  data_temp <- df_engineered %>%
+    mutate(Win_Factor = factor(Win, 
+                               levels = c(1, 0), 
+                               labels = c("Vittoria", "Sconfitta")))
+  
+  p1 <- plot_box_minimal(data_temp, "Rating_Max", "Rating Massimo")
+  p2 <- plot_box_minimal(data_temp, "Rating_SD", "Disparità di Rating")
+  p3 <- plot_box_minimal(data_temp, "Kill_Concentration", "Concentrazione di Kill")
+  p4 <- plot_box_minimal(data_temp, "Assists_per_Kill", "Rapporto Assist / Kill")
+  
+  (p1 + p2) / (p3 + p4)
+}
+
+
+```
+
+L'analisi visiva evidenzia le seguenti dinamiche rispetto all'esito del match.
+
+*   **Impatto del talento di punta** (`Rating_Max`): è l'unico indicatore a mostrare una separazione netta. I vincitori presentano una mediana superiore (~1.5 vs ~1.2) e scarsa sovrapposizione, delineando il picco prestazionale individuale come il *driver* visivamente più solido per il successo.
+*   **Coesione come requisito** (`Rating_SD` e `Assists_per_Kill`): le distribuzioni quasi sovrapponibili suggeriscono che l'equilibrio interno e la sinergia siano requisiti minimi comuni a tutti i team d'élite, ma non fattori discriminanti per la vittoria.
+*   **Limite della polarizzazione** (`Kill_Concentration`): la mancata separazione tra i gruppi indica che accentrare le *kill* su un singolo è meno efficace dell'impatto globale (Rating): il "volume" di fuoco conta meno della qualità generale della giocata.
+*   **Analisi delle anomalie**: la presenza di *outlier* rivela scenari di "carry impotente" (ottime performance singole in sconfitta) o vittorie ottenute nonostante forti squilibri interni, confermando la natura non lineare della competizione.
+
+In conclusione, sebbene il **talento di punta** appaia determinante, l'attuale analisi bivariata non coglie le interazioni simultanee; il peso marginale reale di ogni fattore sarà quindi isolato attraverso il successivo modello di regressione **multivariata**.
+
+
+## **Variable Selection**
+L'obiettivo di questa fase è quello di selezionare i predittori che massimizzano la **capacità esplicativa** del modello, minimizzando al contempo il rumore statistico.
+
+### *Data splitting*
+
+Prima di avviare la selezione delle variabili, il dataset è stato depurato dai metadati descrittivi (`Match.Name`, `Map`, `Player.Team`) che, pur contestualizzando l'evento, non possiedono valore predittivo statistico.
+Successivamente, si è proceduto alla suddivisione casuale delle osservazioni in **2 partizioni**:
+
+1. **Training Set (75%):** utilizzato per tutte le fasi di addestramento e selezione delle variabili (*VIF*, *Stepwise*, *LASSO/RIDGE*, *Cross Validation*).
+2. **Test Set (25%):** mantenuto rigorosamente isolato fino alla fine dell'analisi per testare la capacità di generalizzazione del modello su dati inediti.
+
+Questa separazione è fondamentale per garantire l'onestà della valutazione finale e scongiurare il rischio di *data leakage*, fenomeno che si verifica quando informazioni che dovrebbero essere "nascoste" vengono impropriamente utilizzate durante l'addestramento, portando a stime delle prestazioni irrealisticamente ottimistiche.
+
+
+```{r data-splitting}
+
+set.seed(123) 
+
+# rimozione delle variabili non predittive (metadati)
+df_model <- df_engineered %>%
+  ungroup() %>%
+  select(-c(Match.Name, Map, Player.Team))
+
+# split casuale 75-25
+train_index <- sample(seq_len(nrow(df_model)), size = 0.75 * nrow(df_model))
+
+train_set <- df_model[train_index, ]
+test_set  <- df_model[-train_index, ]
+
+```
+
+### *Analisi di multicollinearità - VIF*
+
+Per scongiurare il rischio di **multicollinearità** — ovvero una situazione di dipendenza lineare tra i predittori che renderebbe instabili le stime dei coefficienti — si è fatto ricorso al **_Variance Inflation Factor_ (VIF)**.
+
+Il VIF per una variabile $j$ è definito come:
+
+$$ VIF_j = \frac{1}{1 - R^2_j} $$
+
+dove $R^2_j$ è il coefficiente di determinazione ottenuto regredendo la variabile $X_j$ su tutte le altre variabili esplicative. Un valore di $VIF > 5$ indica che la variabile porta con sé un'informazione già ampiamente spiegata dagli altri predittori.
+
+L'analisi è stata condotta con un approccio **iterativo** applicato al *Training Set*. Partendo dal modello ottenuto al punto precedente, si sono calcolati i VIF ad ogni passaggio, eliminando progressivamente la variabile con il valore più elevato fino al raggiungimento della soglia di sicurezza ($VIF < 5$ per tutti i predittori), tenendo anche conto dei risultati ottenuti tramite la *matrice di correlazione* nella fase di *EDA*. Di seguito si riportano le esclusioni effettuate.
+
+```{r vif-logic}
+
+# partiamo da tutte le variabili del train_set (tranne Win)
+predictors <- setdiff(names(train_set), "Win")
+threshold <- 5
+removal_history <- list() # qui salveremo i dati per il report
+iterazione <- 1
+
+# funzione per le interpretazioni (basata sui risultati dell'EDA)
+get_reason <- function(var_name) {
+  if (var_name == "ACS_Mean") return("Correlazione quasi perfetta (0.96) con ADR_Mean.")
+  if (var_name == "Rating_Mean") return("Correlazione molto elevata (0.87) con ADR_Mean.")
+  if (var_name == "Deaths_Tot") return("VIF maggiore, inoltre è una metrica poco informativa rispetto agli altri indicatori.")
+  return("Alta collinearità generica con il resto dei predittori.")
+}
+
+repeat {
+  form <- as.formula(paste("Win ~", paste(predictors, collapse = " + ")))
+  
+  model_temp <- tryCatch(glm(form, data = train_set, family = binomial), error = function(e) NULL)
+  
+  if (is.null(model_temp)) break 
+  vif_vals <- tryCatch(car::vif(model_temp), error = function(e) NULL)
+  if (is.null(vif_vals)) break 
+  
+  max_vif <- max(vif_vals)
+  
+  if (max_vif < threshold) break
+  
+  # dati per il report
+  var_to_remove <- names(vif_vals)[which.max(vif_vals)]
+  sorted_vifs <- sort(vif_vals, decreasing = TRUE)
+  gap <- max_vif - (if(length(sorted_vifs) > 1) sorted_vifs[2] else 0)
+  
+  # salvataggio nel log
+  removal_history[[iterazione]] <- list(
+    var = var_to_remove,
+    vif = max_vif,
+    gap = gap,
+    reason = get_reason(var_to_remove)
+  )
+  
+  predictors <- predictors[predictors != var_to_remove]
+  iterazione <- iterazione + 1
+}
+
+# salviamo i predittori finali
+final_predictors_vif <- predictors
+
+# aggiorniamo il train set con questi soli predittori
+train_set_vif <- train_set %>%
+  select(Win, all_of(final_predictors_vif))
+
+```
+
+```{r print-vif-log, results='asis'}
+
+# stampa dei risultati nel report
+for (i in seq_along(removal_history)) {
+  item <- removal_history[[i]]
+  
+  cat(paste0("* **Iterazione ", i, "**: Rimossa variabile **`", item$var, "`**.\n"))
+  cat(paste0("    * **VIF:** ", round(item$vif, 2), " (distacco dal secondo: +", round(item$gap, 2), ")\n"))
+  cat(paste0("    * **Interpretazione:** ", item$reason, "\n\n"))
+}
+
+```
+
+Al termine del processo, si è giunti ad un set di **`r length(final_predictors_vif)` variabili** esplicative (oltre alla variabile risposta `Win`), riportate nella tabella sottostante.
+
+```{r vif-finalization}
+
+# creazione  del modello
+form_final <- as.formula(paste("Win ~", paste(final_predictors_vif, collapse = " + ")))
+model_final_vif <- glm(form_final, data = train_set, family = binomial)
+vif_final <- car::vif(model_final_vif)
+
+# creazione della tabella di recap
+vif_df <- data.frame(
+  Variabile = names(vif_final),
+  VIF = round(as.numeric(vif_final), 2) 
+) %>%
+  arrange(desc(VIF))
+
+n_rows <- nrow(vif_df)
+target_rows <- ceiling(n_rows / 3)
+
+part1 <- vif_df[1:target_rows, ]
+part2 <- vif_df[(target_rows + 1):(target_rows * 2), ]
+part3 <- vif_df[((target_rows * 2) + 1):n_rows, ]
+
+vif_grid <- cbind(part1, part2, part3)
+
+border_color <- "#333333" 
+inner_sep <- "#eeeeee"
+
+caption_style <- '<div style="text-align: center; color: #bbbbbb; font-size: 16px; margin-bottom: 1 px;">Tabella finale Variabile-VIF</div>'
+
+kbl(vif_grid, col.names = rep(c("Variabile", "VIF"), 3), align = "lclclc", caption = caption_style) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), 
+                full_width = TRUE, 
+                font_size = 14,
+                html_font = "Segoe UI") %>% 
+
+  row_spec(0, bold = TRUE, color = "white", background = "#2c3e50", 
+           extra_css = paste0("border-top: 2px solid ", border_color, "; ",
+                              "border-bottom: 2px solid ", border_color, "; ",
+                              "border-left: 2px solid ", border_color, "; ",
+                              "border-right: 2px solid ", border_color, ";")) %>%
+  
+  row_spec(nrow(vif_grid), extra_css = paste0("border-bottom: 2px solid ", border_color, ";")) %>%
+  
+  column_spec(1, width = "14%", bold = TRUE, 
+              extra_css = paste0("border-left: 2px solid ", border_color, "; border-right: 1px solid ", inner_sep, ";")) %>%
+  column_spec(2, width = "6%", extra_css = "border-right: 1px solid #ccc;", 
+              color = ifelse(vif_grid[,2] < 5, "#27ae60", "#c0392b"), bold = TRUE) %>%
+
+  column_spec(3, width = "14%", bold = TRUE, 
+              extra_css = paste0("padding-left: 15px; border-right: 1px solid ", inner_sep, ";")) %>% 
+  column_spec(4, width = "6%", extra_css = "border-right: 1px solid #ccc;", 
+              color = ifelse(vif_grid[,4] < 5, "#27ae60", "#c0392b"), bold = TRUE) %>%
+
+  column_spec(5, width = "14%", bold = TRUE, 
+              extra_css = paste0("padding-left: 15px; border-right: 1px solid ", inner_sep, ";")) %>%
+  column_spec(6, width = "6%", extra_css = paste0("border-right: 2px solid ", border_color, ";"), 
+              color = ifelse(vif_grid[,6] < 5, "#27ae60", "#c0392b"), bold = TRUE)
+```
+
+### *Approccio classico: Stepwise Selection*
+
+Per isolare i predittori più efficaci, si è adottata la procedura **Stepwise**, utilizzando l'**AIC** (*Akaike Information Criterion*) come metrica di giudizio.
+L'**AIC** funge da "bilancia statistica": premia la capacità del modello di adattarsi ai dati, ma aggiunge una penalizzazione per ogni variabile aggiunta. Attraverso questo meccanismo, il criterio permette di ottimizzare il *variance-bias trade-off*, selezionando modelli che riducono al minimo l'errore di stima (bias) senza cadere nella trappola dell'overfitting (alta varianza).
+
+L'algoritmo è stato applicato al dataset post-VIF confrontando tre strategie di esplorazione.
+
+1. **Forward Selection**: parte da un modello vuoto e aggiunge una variabile alla volta.
+2. **Backward Elimination**: parte dal modello completo e scarta progressivamente le variabili ritenute inutili.
+3. **Bidirezionale (Both)**: è la tecnica più flessibile, ad ogni passaggio valuta sia l'aggiunta di nuove variabili che la rimozione di quelle divenute ridondanti a seguito dei nuovi inserimenti, permettendo così al modello di correggere le scelte precedenti.
+
+```{r stepwise-selection}
+
+# definizione del modello nullo e del modello completo
+null_model <- glm(Win ~ 1, data = train_set_vif, family = binomial)
+full_model <- glm(Win ~ ., data = train_set_vif, family = binomial) 
+
+# esecuzione degli algoritmi stepwise
+step_fwd  <- step(null_model, scope = list(lower = null_model, upper = full_model), direction = "forward", trace = 0)
+step_back <- step(full_model, direction = "backward", trace = 0)
+step_both <- step(full_model, scope = list(lower = null_model, upper = full_model), direction = "both", trace = 0)
+
+# dataframe di confronto
+comparison_aic <- data.frame(
+  Metodo = c("Forward Selection", "Backward Elimination", "Bidirezionale (Both)"),
+  AIC = c(AIC(step_fwd), AIC(step_back), AIC(step_both)),
+  N_Variabili = c(length(coef(step_fwd))-1, length(coef(step_back))-1, length(coef(step_both))-1)
+)%>% 
+  rename(`N. Variabili` = N_Variabili)
+
+raw_stepwise_data <- tidy(step_back) %>%
+  filter(term != "(Intercept)") %>% 
+  arrange(p.value)
+
+p_values_numeric <- raw_stepwise_data$p.value 
+
+final_stepwise_tab <- raw_stepwise_data %>%
+  select(term, estimate, p.value) %>% 
+  mutate(
+    term = c("Rating_Max", "Rating_SD", "FirstDeaths_Tot"), 
+    
+    p.value = sprintf("%.7f", p.value),
+    
+    estimate = round(estimate, 3)
+  ) %>%
+  rename(
+    Variabile = term,
+    `Coefficienti` = estimate, 
+    `P-value` = p.value        
+  )
+
+col_header_bg <- "#2c3e50"   
+col_border_out <- "#333333"  
+col_border_in  <- "#cccccc"  
+col_highlight  <- "#27ae60"
+
+# generazione della prima tabella
+
+caption_style <- '<div style="text-align: center; color: #bbbbbb; font-size: 16px; margin-bottom: 1 px;">Confronto performance algoritmi</div>'
+
+t1 <- kbl(comparison_aic, caption = caption_style, align = "lcc") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), 
+                full_width = FALSE, 
+                position = "float_left",
+                font_size = 13,
+                html_font = "Segoe UI") %>%
+  
+  row_spec(0, bold = TRUE, color = "white", background = col_header_bg, 
+           extra_css = paste0("border: 2px solid ", col_border_out, ";")) %>%
+  
+  row_spec(nrow(comparison_aic), extra_css = paste0("border-bottom: 2px solid ", col_border_out, ";")) %>%
+  
+  column_spec(1, bold = TRUE, width = "160px",
+              extra_css = paste0("border-left: 2px solid ", col_border_out, "; border-right: 1px solid ", col_border_in, ";")) %>%
+
+  column_spec(2, width = "80px",
+              color = ifelse(comparison_aic$AIC == min(comparison_aic$AIC), col_highlight, "black"),
+              bold  = ifelse(comparison_aic$AIC == min(comparison_aic$AIC), TRUE, FALSE),
+              extra_css = paste0("border-right: 1px solid ", col_border_in, ";")) %>%
+  
+  column_spec(3, width = "80px",
+              extra_css = paste0("border-right: 2px solid ", col_border_out, "; margin-right: 50px;"))
+
+
+# generazione della seconda tabella
+
+caption_style <- '<div style="text-align: center; color: #bbbbbb; font-size: 16px; margin-bottom: 1 px;">Variabili selezionate</div>'
+
+t2 <- kbl(final_stepwise_tab, caption = caption_style, align = "lcc") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), 
+                full_width = FALSE, 
+                position = "left",
+                font_size = 13,
+                html_font = "Segoe UI") %>%
+  
+  row_spec(0, bold = TRUE, color = "white", background = col_header_bg, 
+           extra_css = paste0("border: 2px solid ", col_border_out, ";")) %>%
+  
+  row_spec(nrow(final_stepwise_tab), extra_css = paste0("border-bottom: 2px solid ", col_border_out, ";")) %>%
+  
+  column_spec(1, bold = TRUE, width = "150px",
+              extra_css = paste0("border-left: 2px solid ", col_border_out, "; border-right: 1px solid ", col_border_in, ";")) %>%
+  
+  column_spec(2, width = "100px", extra_css = paste0("border-right: 1px solid ", col_border_in, ";")) %>%
+  
+  column_spec(3, width = "100px",
+              color = ifelse(p_values_numeric < 0.05, col_highlight, "black"),
+              bold = TRUE,
+              extra_css = paste0("border-right: 2px solid ", col_border_out, ";"))
+
+t1
+t2
+
+```
+
+L'analisi conferma la robustezza del set di variabili identificato ($AIC \approx 217.7$, identico per *backward*, *forward* e *both*), evidenziando tre driver chiave:
+
+1. `Rating_Max` (coefficiente positivo): il talento del miglior giocatore aumenta drasticamente la probabilità di vittoria (p-value bassissimo).
+2. `Rating_SD` (coefficiente negativo): lo squilibrio interno penalizza la squadra (serve coesione nei livelli di skill).
+3. `FirstDeaths_Tot` (coefficiente negativo): la tendenza a subire la prima eliminazione riduce le chance di successo.
+
+### *Approccio moderno: LASSO/RIDGE*
+A completamento della fase di selezione, si è applicato un approccio basato sulla **regolarizzazione**, una tecnica che migliora la capacità di generalizzazione del modello penalizzando le stime dei coefficienti per ridurre il rischio di *overfitting*.  
+Sono stati confrontati due metodi distinti:  
+
+*   **LASSO**: applicando una penalità rigorosa, questo algoritmo ha la proprietà di azzerare completamente i coefficienti delle variabili meno rilevanti.
+*   **Ridge**: A differenza della LASSO, questo metodo contrae i coefficienti verso lo zero senza mai annullarli. È particolarmente efficace nel gestire gruppi di variabili correlate, distribuendo il peso predittivo tra di esse invece di escluderle.
+
+Per entrambi, l'intensità della penalità ottimale è stata calibrata tramite *10-Fold Cross-Validation*. I coefficienti stimati dai modelli così ottimizzati sono riportati nella tabella di confronto sottostante.
+
+```{r lasso-ridge}
+
+# esecuzione degli algoritmi
+
+x_matrix <- model.matrix(Win ~ ., data = train_set_vif)[, -1] 
+y_vector <- train_set_vif$Win
+
+set.seed(123)
+cv_lasso <- cv.glmnet(x_matrix, y_vector, family = "binomial", alpha = 1)
+coef_lasso <- as.numeric(coef(cv_lasso, s = cv_lasso$lambda.min))[-1]
+
+cv_ridge <- cv.glmnet(x_matrix, y_vector, family = "binomial", alpha = 0)
+coef_ridge <- as.numeric(coef(cv_ridge, s = cv_ridge$lambda.min))[-1]
+
+comparison_df <- data.frame(
+  Variabile = colnames(x_matrix),
+  LASSO = round(coef_lasso, 3),
+  Ridge = round(coef_ridge, 3)
+) %>%
+  arrange(desc(abs(Ridge)))
+
+df_transposed <- as.data.frame(t(comparison_df[, -1]))
+colnames(df_transposed) <- comparison_df$Variabile
+
+df_vis <- df_transposed
+df_vis$Metodo <- c("LASSO", "Ridge")
+df_vis <- df_vis %>% select(Metodo, everything())
+
+n_cols <- ncol(df_vis)
+n_rows <- nrow(df_vis)
+bg_matrix <- matrix("white", nrow = n_rows, ncol = n_cols)
+
+green_bg <- "#d5f5e3"
+
+bg_matrix[1, c(3, 4, 7)] <- green_bg
+bg_matrix[2, c(2, 3, 4)] <- green_bg
+
+col_header <- "#2c3e50"
+col_border <- "#333333" 
+col_inner  <- "#cccccc" 
+
+# generazione della tabella
+
+caption_style <- '<div style="text-align: center; color: #bbbbbb; font-size: 16px; margin-bottom: 1 px;">Analisi dei coefficienti</div>'
+
+kbl(df_vis, row.names = FALSE, caption = caption_style, align = "c") %>%
+  kable_styling(bootstrap_options = c("hover", "condensed"), 
+                full_width = FALSE, 
+                font_size = 12, 
+                html_font = "Segoe UI") %>%
+  
+  row_spec(0, bold = TRUE, color = "white", background = col_header, 
+           extra_css = paste0("border-top: 2px solid ", col_border, "; ",
+                              "border-bottom: 2px solid ", col_border, "; ",
+                              "border-left: 2px solid ", col_border, "; ",
+                              "border-right: 2px solid ", col_border, ";")) %>%
+
+  row_spec(1, extra_css = paste0("border-bottom: 1px solid ", col_inner, ";")) %>%
+  
+  {
+    res <- . 
+    for(i in 1:n_cols) {
+      
+      border_left <- ifelse(i == 1, paste0("2px solid ", col_border), "none")
+      border_right <- ifelse(i == n_cols, paste0("2px solid ", col_border), paste0("1px solid ", col_inner))
+      
+      css_string <- paste0("border-left: ", border_left, "; border-right: ", border_right, ";")
+      
+      res <- column_spec(res, i, 
+                         bold = (i == 1), 
+                         background = bg_matrix[, i], 
+                         extra_css = css_string)
+    }
+    res 
+  } %>%
+  
+  row_spec(n_rows, extra_css = paste0("border-bottom: 2px solid ", col_border, ";"))
+```
+L'analisi congiunta dei metodi classici e regolarizzati permette di definire i tre set di variabili che verranno sottoposti a validazione comparativa. Per quanto riguarda la *Ridge*, non operando un azzeramento automatico dei coefficienti, si sono selezionati i 3 predittori con il valore assoluto più elevato. 
+
+I tre set di variabili candidati risultanti sono:  
+1.  **Set Stepwise**: `Rating_Max`, `Rating_SD`, `FirstDeaths_Tot`.  
+2.  **Set LASSO**: `Rating_Max`, `KAST_Mean`, `FirstDeaths_Tot`.  
+3.  **Set Ridge**: `Kill_Concentration`, `KAST_Mean`, `Rating_Max`.
+
+
+## **Model Selection**
+
+In questa sezione si procede alla valutazione comparativa dei set di variabili candidati e al successivo raffinamento (*refinement*) del modello vincitore tramite analisi delle interazioni e diagnostica.
+
+### *Confronto tra modelli (10-Fold Cross Validation)*
+
+Per selezionare il modello più performante tra le tre configurazioni candidate, si è proceduto ad una stima delle capacità predittive tramite **10-Fold Cross-Validation**.
+Questa tecnica consiste nel suddividere casualmente il campione in 10 gruppi (*folds*): iterativamente, il modello viene addestrato su 9 gruppi e testato sul decimo rimanente. Il processo restituisce l'**Errore Medio di Previsione** commesso nelle iterazioni, da cui si deriva l'**Accuratezza Stimata** ($1 - \text{errore}$) per quantificare la percentuale di successi attesa.
+
+È cruciale precisare che questa procedura è stata applicata **esclusivamente** al *Training Set*. Sebbene le stime risultanti possano essere lievemente ottimistiche (*bias* di selezione), essendo che le variabili sono state identificate su questi stessi dati, tale approccio è metodologicamente necessario: utilizzare il *Test Set* in questa fase di confronto costituirebbe un *data leakage*, invalidando la sua funzione. Accettiamo quindi questo lieve *bias* in fase di selezione pur di garantire che il *Test Set* rimanga un banco di prova totalmente "nuovo" per la valutazione del modello finale.
+
+I tre set di variabili sono stati utilizzati per addestrare modelli di **regressione logistica standard**, ottenendo i seguenti risultati:
+
+```{r model-comparison-cv}
+
+set.seed(123)
+
+cost_accuracy <- function(r, pi = 0) mean(abs(r - pi) > 0.5)
+
+f_stepwise <- as.formula("Win ~ Rating_Max + Rating_SD + FirstDeaths_Tot")
+f_lasso    <- as.formula("Win ~ Rating_Max + KAST_Mean + FirstDeaths_Tot")
+f_ridge    <- as.formula("Win ~ Kill_Concentration + KAST_Mean + Rating_Max")
+
+glm_stepwise <- glm(f_stepwise, data = train_set_vif, family = binomial)
+glm_lasso    <- glm(f_lasso, data = train_set_vif, family = binomial)
+glm_ridge    <- glm(f_ridge, data = train_set_vif, family = binomial)
+
+err_stepwise <- cv.glm(train_set_vif, glm_stepwise, cost = cost_accuracy, K = 10)$delta[1]
+err_lasso    <- cv.glm(train_set_vif, glm_lasso, cost = cost_accuracy, K = 10)$delta[1]
+err_ridge    <- cv.glm(train_set_vif, glm_ridge, cost = cost_accuracy, K = 10)$delta[1]
+
+# dataframe dei risultati
+results_df <- data.frame(
+  Modello = c("Stepwise Set", "LASSO Set", "Ridge Set"),
+  Errore_CV = round(c(err_stepwise, err_lasso, err_ridge), 4),
+  Accuratezza_Stimata = percent(1 - c(err_stepwise, err_lasso, err_ridge), accuracy = 0.01)
+)
+
+col_header <- "#2c3e50"
+col_border <- "#333333"
+col_inner  <- "#cccccc"
+col_green  <- "#27ae60"
+
+best_idx <- which.min(results_df$Errore_CV)
+
+caption_style <- '<div style="text-align: center; color: #bbbbbb; font-size: 16px; margin-bottom: 1 px;">Confronto tra modelli (10-Fold CV)</div>'
+
+# generazione della tabella
+
+kbl(results_df, 
+    col.names = c("Modello", "Errore CV", "Accuratezza"), 
+    caption = caption_style, 
+    align = "lcc") %>%
+  
+  kable_styling(bootstrap_options = c("striped", "condensed"), 
+                full_width = FALSE, 
+                font_size = 16, 
+                html_font = "Segoe UI") %>%
+
+  row_spec(0, bold = TRUE, color = "white", background = col_header, 
+           extra_css = paste0("border-top: 2px solid ", col_border, "; ",
+                              "border-bottom: 2px solid ", col_border, "; ",
+                              "border-left: 2px solid ", col_border, "; ",
+                              "border-right: 2px solid ", col_border, ";")) %>%
+
+  column_spec(1, bold = TRUE, width = "180px",
+              extra_css = paste0("border-left: 2px solid ", col_border, "; ",
+                                 "border-right: 1px solid ", col_inner, ";")) %>%
+
+  column_spec(2, width = "100px",
+              color = ifelse(seq_len(nrow(results_df)) == best_idx, col_green, "black"),
+              bold  = ifelse(seq_len(nrow(results_df)) == best_idx, TRUE, FALSE),
+              extra_css = paste0("border-right: 1px solid ", col_inner, ";")) %>%
+  
+  column_spec(3, width = "120px",
+              color = ifelse(seq_len(nrow(results_df)) == best_idx, col_green, "black"),
+              bold  = ifelse(seq_len(nrow(results_df)) == best_idx, TRUE, FALSE),
+              extra_css = paste0("border-right: 2px solid ", col_border, ";")) %>%
+  
+  row_spec(nrow(results_df), 
+           extra_css = paste0("border-bottom: 2px solid ", col_border, ";"))
+
+```
+
+Il confronto decreta il modello derivato dal set *Stepwise* come migliore, con un'accuratezza stimata del **74.36%**, risultato che offre alcune interessanti chiavi di lettura.
+
+*   **Equilibrio vs Consistenza (vs *LASSO*):** Il set *Stepwise*, che include la deviazione standard del rating (`Rating_SD`), supera il set *LASSO* basato sul `KAST`. Ciò suggerisce che, per vincere, non è sufficiente che i giocatori siano "mediamente utili" (`KAST`), ma è cruciale che il divario di abilità tra il "*carry*" e il resto del team sia contenuto.
+
+*   **Equilibrio vs Aggressività (vs *Ridge*):** *Stepwise* supera anche il set *Ridge*, che scommetteva sulla variabile `Kill_Concentration`. Questo dato ridimensiona il valore della pura potenza di fuoco accentrata: avere un singolo giocatore che ottiene la maggior parte delle eliminazioni non garantisce la vittoria quanto il mantenere un livello di abilità omogeneo all'interno della squadra.
+
+Sulla base di queste evidenze, il set *Stepwise* (`Rating_Max` + `Rating_SD` + `FirstDeaths_Tot`) viene selezionato come modello definitivo per le successive fasi di raffinamento e diagnostica.
+
+### *Rifinitura del modello*
+
+Definito il set di variabili ottimale si è proceduto a un'ultima verifica strutturale per indagare la presenza di effetti d'**interazione**.
+Nello specifico, è stata testata l'ipotesi di **interazione tra talento ed equilibrio** (`Rating_Max` * `Rating_SD`): l'obiettivo è verificare se l'efficacia del "*fuoriclasse*" nel determinare la vittoria vari a seconda di quanto il resto della squadra è sbilanciato, o se i due fattori agiscano in modo indipendente.
+Per validare questa ipotesi, è stato effettuato un confronto tra il modello base (detto "*annidato*") e il modello con termine di interazione. La verifica si è basata su un **Likelihood Ratio Test** (*test del rapporto di verosimiglianza*), applicato mediante analisi della devianza (`anova`). Tale test valuta se la riduzione dell'errore (devianza) ottenuta grazie all'interazione sia sufficientemente ampia da giustificare la maggiore complessità del modello, o se sia attribuibile al caso.
+
+```{r model-refinement}
+
+# modello senza interazione
+mod_base <- glm(Win ~ Rating_Max + Rating_SD + FirstDeaths_Tot, 
+                data = train_set_vif, family = binomial)
+
+# modello con interazione
+mod_inter <- glm(Win ~ FirstDeaths_Tot + Rating_Max * Rating_SD, 
+                 data = train_set_vif, family = binomial)
+
+# test ANOVA (Likelihood Ratio Test)
+anova_res <- anova(mod_base, mod_inter, test = "Chisq")
+p_val_inter <- anova_res$`Pr(>Chi)`[2]
+
+# scelta del modello
+final_model <- if(p_val_inter < 0.05) mod_inter else mod_base
+
+```
+
+Il test ha restituito un *p-value* di `r format.pval(p_val_inter, eps = .001, digits=4)`. Poiché tale valore è superiore al livello di significatività *0.05*, si conclude che l'**interazione non è significativa**. Si sceglie pertanto di procedere con il modello base.
+
+Di seguito si riportano le stime finali degli *Odds Ratio* e dei relativi *p-values*, calcolati sull'intero *Training Set*.
+
+```{r odds-ratio}
+
+raw_model_data <- tidy(final_model, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)") %>% 
+  select(term, estimate, p.value)
+
+p_vals_numeric <- raw_model_data$p.value
+
+# formattazione dei dati
+
+df_vis <- raw_model_data %>%
+  
+  mutate(
+    term = c("Rating_Max", "Rating_SD", "FirstDeaths_Tot"), 
+    
+    estimate = round(estimate, 3),
+
+    p.value = sprintf("%.7f", p.value)
+  ) %>%
+  rename(
+    Variabile = term,
+    `Odds Ratio` = estimate,
+    `P-Value` = p.value
+  )
+
+col_header <- "#2c3e50"
+col_border <- "#333333"
+col_inner  <- "#cccccc"
+col_green  <- "#27ae60"
+
+# generazione tabella
+
+caption_style <- '<div style="text-align: center; color: #bbbbbb; font-size: 16px; margin-bottom: 1 px;">Tabella degli Odds-Ratio</div>'
+
+kbl(df_vis, caption = caption_style, align = "lcc") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), 
+                full_width = FALSE, 
+                font_size = 13,
+                html_font = "Segoe UI") %>%
+  
+  row_spec(0, bold = TRUE, color = "white", background = col_header, 
+           extra_css = paste0("border-top: 2px solid ", col_border, "; ",
+                              "border-bottom: 2px solid ", col_border, "; ",
+                              "border-left: 2px solid ", col_border, "; ",
+                              "border-right: 2px solid ", col_border, ";")) %>%
+  
+  row_spec(nrow(df_vis), 
+           extra_css = paste0("border-bottom: 2px solid ", col_border, ";")) %>%
+  
+  column_spec(1, bold = TRUE, width = "150px", 
+              extra_css = paste0("border-left: 2px solid ", col_border, "; ",
+                                 "border-right: 1px solid ", col_inner, ";")) %>%
+  
+  column_spec(2, width = "100px", 
+              extra_css = paste0("border-right: 1px solid ", col_inner, ";")) %>%
+  
+  column_spec(3, width = "120px", 
+              color = ifelse(p_vals_numeric < 0.05, col_green, "black"),
+              bold  = ifelse(p_vals_numeric < 0.05, TRUE, FALSE),
+              extra_css = paste0("border-right: 2px solid ", col_border, ";"))
+```
+L'analisi congiunta degli *Odds Ratio* e della significatività statistica delinea il profilo della vittoria. Il driver primario è indiscutibilmente il **talento individuale**: la variabile `Rating_Max` mostra la significatività più elevata (*p-value* ≈ 0.000001) e un impatto positivo massiccio  (*OR* ≈ 124.5), indicando che disporre di un giocatore ampiamente sopra la media è il motore del successo.
+Parallelamente, tuttavia, emerge il ruolo cruciale della struttura di squadra. La variabile `Rating_SD` mantiene una significatività rilevante (*p-value* ≈ 0.034) e un effetto negativo profondo (*OR* ≈ 0.011): questo segnala che il talento del singolo viene vanificato se inserito in un contesto di forte disparità interna. Infine, `FirstDeaths_Tot` agisce come sfumatura tattica, suggerendo che la disciplina collettiva nel non concedere un vantaggio numerico iniziale al nemico rimane un fattore, seppur marginale, per consolidare il risultato.
+
+
+### *Diagnostica del modello*
+A questo punto si è effettuato un controllo diagnostico per escludere che la robustezza del modello sia compromessa da osservazioni influenti o anomalie strutturali nei dati di training.
+
+```{r diagnostics, fig.align = 'center', fig.height=5}
+
+# estrazione dei dati diagnostici
+diag_data <- data.frame(
+  obs_id = 1:nrow(train_set_vif),
+  cooks  = cooks.distance(final_model),
+  std_res = rstandard(final_model, type = "pearson"),
+  leverage = hatvalues(final_model)
+)
+
+# identificazione dei 3 maggiori outlier
+top_3_cooks <- diag_data %>% 
+  arrange(desc(cooks)) %>% 
+  slice(1:3)
+
+# grafico sulla distanza di cook
+p1 <- ggplot(diag_data, aes(x = obs_id, y = cooks)) +
+  
+  geom_segment(aes(xend = obs_id, yend = 0), color = "#e74c3c", alpha = 0.7, size = 0.6) +
+  geom_point(color = "#e74c3c", size = 1.2) +
+  
+  geom_text(data = top_3_cooks, aes(label = obs_id), 
+            vjust = -0.5, fontface = "bold", color = "#2c3e50", size = 3.5) +
+  
+  labs(title = "Distanza di Cook", 
+       x = "Numero dell'osservazione", y = "Distanza di Cook") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "#2c3e50", face = "bold", size = 14, hjust = 0.5),
+    axis.title = element_text(color = "#555555", size = 10),
+    panel.grid.minor = element_blank()
+  )
+
+
+cooks_d <- cooks.distance(final_model)
+max_cook <- max(cooks_d)
+
+# grafico residuals vs leverage
+
+cook_threshold <- 0.5 # soglia di cook (0.5 oppure 1.0, si è scelto 0.5 in modo che fosse visibile anche graficamente, non alterando i risultati)
+
+p_param <- length(coef(final_model)) 
+x_seq <- seq(0.001, max(diag_data$leverage) * 1.1, length.out = 100) 
+
+curve_data <- data.frame(x = x_seq, y = sqrt(cook_threshold * p_param * (1 - x_seq) / x_seq))
+
+max_leverage_val <- max(diag_data$leverage)
+y_curve_at_max <- sqrt(cook_threshold * p_param * (1 - max_leverage_val) / max_leverage_val)
+y_data_max <- max(abs(diag_data$std_res))
+
+y_text_pos <- y_curve_at_max + 0.8 
+
+final_limit <- max(y_text_pos, y_data_max) + 0.2 
+
+p2 <- ggplot(diag_data, aes(x = leverage, y = std_res)) +
+  
+  geom_line(data = curve_data, aes(x = x, y = y), linetype = "longdash", color = "#626567", size = 1.1) +
+  geom_line(data = curve_data, aes(x = x, y = -y), linetype = "longdash", color = "#626567", size = 1.1) +
+  
+  annotate("text", x = max(x_seq), y = y_text_pos, 
+           label = paste("Cook =", cook_threshold), 
+           color = "#626567", 
+           hjust = 1, 
+           vjust = 0.5,
+           size=3, fontface="italic") +
+  
+  geom_point(color = "#34495e", alpha = 0.6, size = 2) +
+  
+  geom_smooth(method = "loess", se = FALSE, color = "#e74c3c", size = 0.8) +
+
+  geom_text(data = top_3_cooks, aes(label = obs_id), 
+            nudge_x = 0.002, 
+            hjust = 0, 
+            fontface = "bold", color = "#2c3e50", size = 3) +
+  
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", alpha = 0.3) +
+  
+  labs(title = "Residuals vs Leverage", 
+       x = "Leverage (Leva)", y = "Std. Pearson Residuals") +
+  
+  scale_y_continuous(limits = c(-final_limit, final_limit)) + 
+  theme_minimal() +
+  theme(
+    plot.title = element_text(color = "#2c3e50", face = "bold", size = 14, hjust = 0.5),
+    axis.title = element_text(color = "#555555", size = 10)
+  )
+
+grid.arrange(p1, p2, ncol = 2)
+
+```
+
+1. **Analisi dell'influenza (distanza di Cook):** il grafico a sinistra evidenzia che nessuna singola partita esercita un'influenza critica sui coefficienti. Il valore massimo (obs. 36) si attesta intorno a **`r round(max_cook, 4)`**, un ordine di grandezza inferiore alla soglia di allerta convenzionale ($D > 0.5$ o $D > 1$). Ciò garantisce che il modello non sia eccessivamente influenzato da pochi casi isolati.
+
+2. **Relazione Residui-Leva:** il grafico a destra evidenzia che i residui più marcati si concentrano prevalentemente nella zona a **leva medio-bassa**, indicando che gli errori di predizione riguardano match statisticamente standard. La linea di tendenza mostra una lieve deviazione positiva in corrispondenza dei valori di leva più alti: questo segnala una marginale imprecisione nelle stime di probabilità per i casi estremi, che tuttavia non inficia la capacità di classificazione globale del modello, come confermato dall'assenza di osservazioni nell'area critica di Cook.
+
+Un focus puntuale sulle osservazioni con residuo maggiore (es. **obs. 63**) chiarisce la natura di questi errori. In questo caso specifico, il team ha ottenuto la vittoria nonostante un `Rating_Max` di appena **0.76**, un valore drasticamente inferiore alla media del campione di training (pari a `r round(mean(train_set_vif$Rating_Max), 2)`).
+Per il modello, che identifica nel picco di talento il motore del successo, questo esito rappresenta un'anomalia statistica (un "*upset* sportivo"). Tuttavia, il fatto che tali eccezioni siano rare e associate a una bassa leva conferma la validità della regola generale: vincere senza una prestazione individuale sopra la media è possibile, ma improbabile.
+
+## **Analisi di performance**
+### *Curva ROC e AUC*
+La prima fase della validazione misura la capacità del modello di discriminare tra vittorie e sconfitte sui dati inediti del **_Test Set_**. L'efficacia complessiva è quantificata dall'*Area Sotto la Curva* (**AUC**), dove 0.5 indica un modello casuale mentre 1 rappresenta un classificatore perfetto.
+
+```{r roc-curve, fig.align='center', fig.height=5.5}
+
+# calibrazione della soglia di Youden sul TRAINING SET
+
+probs_train <- predict(final_model, newdata = train_set_vif, type = "response")
+roc_train   <- roc(train_set_vif$Win, probs_train, quiet = TRUE)
+
+best_coords_train <- coords(roc_train, "best", best.method = "youden", 
+                            ret = c("threshold"))
+best_threshold <- as.numeric(best_coords_train$threshold)
+
+# validazione sul TEST SET
+
+probs_test <- predict(final_model, newdata = test_set, type = "response")
+roc_test   <- roc(test_set$Win, probs_test, quiet = TRUE)
+auc_test   <- auc(roc_test)
+
+test_point_coords <- coords(roc_test, x = best_threshold, input = "threshold", 
+                            ret = c("specificity", "sensitivity"))
+
+spec_point <- as.numeric(test_point_coords$specificity)
+sens_point <- as.numeric(test_point_coords$sensitivity)
+
+# generazione del grafico
+
+ggroc(roc_test, color = "#0073C2", size = 1.5) +
+  
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), 
+               color = "grey60", linetype = "dashed", size = 0.8) +
+  
+  annotate("point", x = spec_point, y = sens_point, color = "white", size = 6) +
+  annotate("point", x = spec_point, y = sens_point, color = "#D55E00", size = 4) +
+  annotate("label", x = 0.45, y = 0.25, 
+           label = paste0("AUC = ", round(auc_test, 3), "\n",
+                          "Soglia Calibrata: ", round(best_threshold, 3)), 
+           size = 5, 
+           fontface = "bold", 
+           color = "#00468B",
+           fill = "#F0F8FF",
+           label.size = NA,
+           alpha = 0.9) + 
+  
+  labs(
+    title = "Performance Modello (Curva ROC)",
+    subtitle = "Valutazione sul Test Set con soglia ottimale",
+    x = "Specificità (Tasso Veri Negativi)",
+    y = "Sensibilità (Tasso Veri Positivi)"
+  ) +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5, color = "#2c3e50"),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, color = "grey40", margin = margin(b = 10)),
+    
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(color = "grey30"),
+    
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey92"),
+    
+    panel.border = element_rect(colour = "grey80", fill = NA, size = 1)
+  )
+```
+
+Il modello ottiene un AUC di **`r round(auc_test, 3)`**, valore che denota un'eccellente capacità predittiva. La curva si estende decisamente verso l'angolo superiore sinistro, confermando che il set di variabili selezionato è in grado di distinguere vittorie e sconfitte con un alto tasso di veri positivi mantenendo bassi i falsi positivi.
+
+### *Matrice di confusione e altre metriche*
+
+Per tradurre le probabilità continue stimate dal modello in previsioni binarie (vittoria/sconfitta) è indispensabile stabilire una **soglia di taglio** (*cut-off*).
+
+Anziché adottare a priori il valore standard di 0.5 (che presuppone costi di errore simmetrici e classi perfettamente bilanciate), si utilizza la **Soglia di Youden** calibrata nel paragrafo precedente. Questo indice *J* è definito come: $J = \text{Sensitivity} + \text{Specificity} - 1$.
+La selezione di tale soglia permette di identificare il punto operativo che massimizza congiuntamente la capacità del modello di rilevare i veri positivi e i veri negativi, adattando il decisore alla specifica distribuzione di probabilità dei dati.
+Per evitare fenomeni di *data leakage* (falsificazione dei risultati), la soglia è stata calcolata esclusivamente sul **Training Set** e viene qui applicata ai dati del **Test Set** per valutarne le performance reali.
+
+Di seguito si riportano la Matrice di Confusione e le metriche di performance risultanti.
+
+
+```{r confusion-matrix-and-matrix}
+
+# calcolo delle metriche
+pred_class <- factor(ifelse(probs_test >= best_threshold, 1, 0), levels = c(0, 1))
+actual_class <- factor(test_set$Win, levels = c(0, 1))
+cm_obj <- confusionMatrix(pred_class, actual_class, positive = "1")
+conf_mat <- cm_obj$table
+metrics  <- cm_obj$byClass
+accuracy <- cm_obj$overall["Accuracy"]
+
+metrics_df <- data.frame(
+  Metrica = c("Accuracy", "Sensitivity", "Specificity", "Precision"),
+  Valore = percent(c(accuracy, metrics["Sensitivity"], metrics["Specificity"], metrics["Precision"]), accuracy = 0.1),
+  Descrizione = c("Percentuale totale di risposte corrette. Il modello ha un'ottima capacità predittiva globale.",
+                  "Capacità di individuare le vittorie. Il modello riconosce quasi tutte le vere vittorie.",
+                  "Capacità di individuare le sconfitte. Il modello fatica un po' di più a riconoscere quando un team perderà.",
+                  paste0("Affidabilità della previsione positiva. Quando il modello prevede 'Vittoria', ha ragione circa l'", round(metrics["Precision"]*100, 1), "% delle volte.")
+  )
+)
+
+# generazione della MATRICE DI CONFUSIONE
+
+create_header <- function(title) {
+paste0('<div style="text-align: center; color: #bbbbbb; font-size: 16px; margin-bottom: 5px;">', title, '</div>')
+}
+
+col_outer    <- "#2c3e50"
+col_labels   <- "#e9ecef"
+col_inner    <- "#bbbbbb"
+
+# estrazione dinamica dei dati
+val_ss <- as.character(conf_mat[1, 1])
+val_sv <- as.character(conf_mat[1, 2])
+val_vs <- as.character(conf_mat[2, 1])
+val_vv <- as.character(conf_mat[2, 2])
+
+df_grid <- rbind(
+  c("", "DATO", "REALE"),
+  c("PREVISIONE", "SCONFITTA", "VITTORIA"),
+  c("SCONFITTA", val_ss, val_sv),
+  c("VITTORIA",  val_vs, val_vv)
+)
+
+kbl(df_grid, 
+    format = "html", 
+    col.names = NULL, 
+    align = "c", 
+    escape = FALSE,
+    caption = create_header("Confusion Matrix"),
+    table.attr = "class='cm-table'") %>% 
+  
+  kable_styling(full_width = FALSE, position = "center", html_font = "Segoe UI") %>%
+  
+  column_spec(1, width = "130px") %>%
+  column_spec(2, width = "100px") %>%
+  column_spec(3, width = "100px") %>%
+  
+  # CSS per visualizzare meglio la matrice
+  footnote(general = paste0("
+    <style>
+    
+      .cm-table {
+        border-collapse: collapse !important;
+        margin-top: 20px;
+        border: none;
+      }
+      .cm-table td {
+        padding: 10px;
+        font-family: 'Segoe UI', sans-serif;
+        box-sizing: border-box;
+      }
+      
+      .cm-table tr:nth-child(1) td:nth-child(1) {
+        background: transparent !important;
+        border: none !important;
+      }
+      
+      .cm-table tr:nth-child(1) td:nth-child(2) {
+        background-color: ", col_outer, " !important;
+        color: white !important;
+        font-weight: bold;
+        text-align: right !important;
+        padding-right: 3px !important;
+        border-top: 1.5px solid ", col_outer, ";
+        border-right: none !important;
+      }
+      
+      .cm-table tr:nth-child(1) td:nth-child(3) {
+        background-color: ", col_outer, " !important;
+        color: white !important;
+        font-weight: bold;
+        text-align: left !important;
+        padding-left: 3px !important;
+        border-top: 1.5px solid ", col_outer, ";
+        border-left: none !important;
+        border-right: 1.5px solid ", col_outer, ";
+      }
+      
+      .cm-table tr:nth-child(2) td:nth-child(1) {
+        background-color: ", col_outer, " !important;
+        color: white !important;
+        font-weight: bold;
+        border: 1.5px solid ", col_outer, ";
+      }
+      
+      .cm-table tr:nth-child(2) td:nth-child(2),
+      .cm-table tr:nth-child(2) td:nth-child(3) {
+        background-color: ", col_labels, " !important;
+        color: #333 !important;
+        font-weight: bold;
+        border-bottom: 1px solid ", col_inner, ";
+        border-right: 1px solid ", col_inner, ";
+        border-top: 1px solid ", col_inner, ";
+      }
+      
+      .cm-table tr:nth-child(2) td:nth-child(3) {
+        border-right: 1.5px solid ", col_outer, " !important;
+      }
+      
+      .cm-table tr:nth-child(3) td:nth-child(1),
+      .cm-table tr:nth-child(4) td:nth-child(1) {
+        background-color: ", col_labels, " !important;
+        color: #333 !important;
+        font-weight: bold;
+        border-left: 1.5px solid ", col_outer, ";
+        border-right: 1px solid ", col_inner, ";
+        border-bottom: 1px solid ", col_inner, ";
+      }
+      
+      .cm-table tr:nth-child(3) td:nth-child(2), .cm-table tr:nth-child(3) td:nth-child(3),
+      .cm-table tr:nth-child(4) td:nth-child(2), .cm-table tr:nth-child(4) td:nth-child(3) {
+        background-color: white !important;
+        color: black !important;
+        font-size: 16px;
+        border-right: 1px solid ", col_inner, ";
+        border-bottom: 1px solid ", col_inner, ";
+      }
+      
+      .cm-table tr:nth-child(3) td:nth-child(3),
+      .cm-table tr:nth-child(4) td:nth-child(3) {
+        border-right: 1.5px solid ", col_outer, " !important;
+      }
+      
+      .cm-table tr:last-child td {
+        border-bottom: 1.5px solid ", col_outer, " !important;
+      } 
+    </style>
+  "), escape = FALSE, general_title = "")
+
+
+
+# generazione della tabella delle metriche riassuntive
+
+t2 <- kbl(metrics_df, row.names = FALSE, caption = create_header("Metriche di valutazione"), align = "lcl") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), 
+                full_width = FALSE, 
+                position = "center", 
+                font_size = 14, html_font = "Segoe UI") %>%
+  
+  row_spec(0, bold = TRUE, color = "white", background = col_header, 
+           extra_css = paste0("border: 2px solid ", col_border, ";")) %>%
+  
+  column_spec(1, bold = TRUE, 
+              extra_css = paste0("border-left: 2px solid ", col_border, "; border-right: 1px solid ", col_inner, "; vertical-align: middle;")) %>%
+  
+  column_spec(2, bold = TRUE, color = col_green, width = "80px", 
+              extra_css = paste0("text-align: center; border-right: 1px solid ", col_inner, "; vertical-align: middle;")) %>%
+  
+  column_spec(3, italic = TRUE, color = "#555555", 
+              extra_css = paste0("border-right: 2px solid ", col_border, "; vertical-align: middle; padding-left: 10px; padding-right: 10px;")) %>%
+  
+  row_spec(nrow(metrics_df), 
+           extra_css = paste0("border-bottom: 2px solid ", col_border, ";"))
+
+t2
+
+```
+
+
+## **Conclusioni**
+Lo studio si proponeva di quantificare il peso relativo del talento individuale ("*Carry*") rispetto alla coesione del collettivo nel determinare la vittoria in *Valorant*.
+Come evidenziato dalla tabella degli *Odds Ratio*, la risposta statistica indica una chiara **predominanza del talento individuale**. La variabile `Rating_Max` si conferma il predittore più forte e significativo, suggerendo che la presenza di una "punta di diamante" è la condizione necessaria per spezzare gli equilibri della partita.
+Tuttavia, l'analisi rivela che la dimensione **collettiva** mantiene una rilevanza fondamentale, seppur in una forma diversa dalle metriche di supporto classiche (come il numero di *assist*, immediatamente scartato). La significatività della variabile `Rating_SD` dimostra che il successo del singolo dipende strettamente dalla solidità dei compagni: un team troppo sbilanciato annulla il vantaggio creato dal fuoriclasse.
+A completamento del quadro, emerge una sfumatura tattica legata alla disciplina. È significativo che il modello abbia selezionato le *First Deaths* scartando le speculari *First Kills*: mentre la capacità di aprire il round è statisticamente assorbita dal talento del fuoriclasse, la tendenza a subire la prima eliminazione rappresenta una dimensione distinta di **errore tattico**. Ciò suggerisce che, una volta garantita la potenza di fuoco, la vittoria si consolida minimizzando i vantaggi numerici concessi all'avversario.
+
+In conclusione, la vittoria non è frutto del solo individualismo né del solo collettivismo, ma di una sinergia specifica: il **talento del singolo** genera le opportunità di vittoria, ma è l'**equilibrio della squadra**, unitamente alla disciplina tattica, a garantire che queste si concretizzino.
+
+
+## **Bibliografia**
+
+<style> /* rientro "sporgente" */
+.apa-bib {
+  padding-left: 1.27cm;
+  text-indent: -1.27cm;
+  margin-bottom: 1em;
+}
+</style>
+
+<div class="apa-bib">
+
+Canty, A., & Ripley, B. (2025). *boot: Bootstrap Functions* (R package version 1.3-32). https://doi.org/10.32614/CRAN.package.boot
+
+Fox, J., & Weisberg, S. (2019). *An R companion to applied regression* (3rd ed.). Sage. https://www.john-fox.ca/Companion/
+
+Friedman, J., Hastie, T., & Tibshirani, R. (2010). Regularization paths for generalized linear models via coordinate descent. *Journal of Statistical Software*, 33(1), 1–22. https://doi.org/10.18637/jss.v033.i01
+
+Kuhn, M. (2008). Building predictive models in R using the caret package. *Journal of Statistical Software*, 28(5), 1–26. https://doi.org/10.18637/jss.v028.i05
+
+Luong, R. (2025). *Valorant Champion Tour 2021-2025 data* [Data set]. Kaggle. https://www.kaggle.com/datasets/ryanluong1/valorant-champion-tour-2021-2023-data (data di ultima consulta: 6 gennaio 2026)
+
+R Core Team. (2025). *R: A language and environment for statistical computing*. R Foundation for Statistical Computing, Vienna, Austria. https://www.R-project.org/
+
+Robin, X., Turck, N., Hainard, A., Tiberti, N., Lisacek, F., Sanchez, J. C., & Müller, M. (2011). pROC: an open-source package for R and S+ to analyze and compare ROC curves. *BMC Bioinformatics*, 12, 77. https://doi.org/10.1186/1471-2105-12-77
+
+Robinson, D., Hayes, A., Couch, S., & Hvitfeldt, E. (2025). *broom: Convert statistical objects into tidy tibbles* (R package version 1.0.11). https://doi.org/10.32614/CRAN.package.broom
+
+Walpole, R. E., Myers, R. H., Myers, S. L., & Ye, K. E. (2016). *Probabilità e statistica per ingegneria e scienze: Strumenti e applicazioni in R* (9a ed.). Pearson.
+
+Wickham, H., Averick, M., Bryan, J., Chang, W., McGowan, L. D., François, R., Grolemund, G., Hayes, A., Henry, L., Hester, J., Kuhn, M., Pedersen, T. L., Miller, E., Bache, S. M., Müller, K., Ooms, J., Robinson, D., Seidel, D. P., Spinu, V., … Yutani, H. (2019). Welcome to the tidyverse. *Journal of Open Source Software*, 4(43), 1686. https://doi.org/10.21105/joss.01686
+
+Youden, W. J. (1950). Index for rating diagnostic tests. *Cancer*, 3(1), 32–35. https://doi.org/bjw536
+
+</div>
+
+
+
+<style>
+
+/* Codice CSS per la formattazione del report */
+
+/* inserisce una parentesi tonda chiusa dopo il numero dei paragrafo*/
+.header-section-number::after {
+  content: ")";
+}
+
+h1.title {
+  color: #2c3e50;
+  font-weight: 800;
+  margin-bottom: 5px;
+}
+
+h3.subtitle {
+  color: #7f8c8d; 
+  font-size: 1.2em;
+  font-weight: normal;
+  margin-top: 0;
+  margin-bottom: 30px;
+}
+
+/* abbellimento del blocco "author" */
+.custom-author-box {
+  background: #f8f9fa;
+  padding: 20px;
+  border-left: 5px solid #2c3e50;
+  border-radius: 5px;
+  margin-top: 20px;
+  margin-bottom: 30px;
+  box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+}
+
+.group-label {
+  font-size: 1.3em;
+  color: #7f8c8d;
+}
+
+.group-name {
+  font-size: 1.4em;
+  font-weight: bold;
+  color: #2c3e50;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.custom-author-box ul {
+  list-style: none;
+  padding-left: 0;
+  margin-top: 15px;
+}
+
+.custom-author-box li {
+  font-size: 1.1em;
+  margin-bottom: 8px;
+  color: #34495e;
+  display: flex;
+  align-items: center;
+}
+
+/* aggiunge un'icona (freccetta) davanti ad ogni nome */
+.custom-author-box li::before {
+  content: "➤"; 
+  color: #18bc9c;
+  margin-right: 10px;
+  font-size: 0.9em;
+}
+
+.date {
+  font-size: 1em;
+  color: #95a5a6;
+  margin-top: 10px;
+  display: block;
+}
+
+/* forza lo spazio dopo il nome in grassetto */
+.custom-author-box li strong, 
+.custom-author-box li b {
+  margin-right: 8px;
+  display: inline-block;
+}
+
+/* ottimizzazione dello spazio */
+
+@media print {
+  
+  @page {
+    margin: 0.4cm;
+  }
+  
+  p {
+    margin-bottom: 5px !important;
+    margin-top: 5 !important;
+  }
+  
+  body { 
+  font-size: 8.5pt; 
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  h1, .h1 { 
+    font-size: 16 !important; 
+    margin-top: 8px; margin-bottom: 5px;
+    color: #2c3e50 !important;
+  }
+  
+  h2, .h2 { 
+    font-size: 15px !important;
+    margin-top: 10px; margin-bottom: 4px;
+    color: #2c3e50 !important;
+  }
+  
+  h3, .h3 { font-size: 12px !important; margin-top: 6px; margin-bottom: 6px}
+
+  h1.title { font-size: 20px !important; margin: 5; }
+  h3.subtitle { font-size: 14px !important; margin-bottom: 5px; }
+  
+  .custom-author-box {
+    padding: 4px;
+    margin-top: 4px;
+    margin-bottom: 4px;
+    border-left-width: 3px;
+  }
+  .custom-author-box ul {
+    margin-top: 5px;
+  }
+  .custom-author-box li {
+    margin-bottom: 2px;
+    font-size: 10pt;
+  }
+  .group-label, .group-name {
+    font-size: 11pt;
+  }
+  
+  .date {
+    margin-top: 5px;
+    margin-bottom: 5px;
+    font-size: 8pt;
+  }
+
+  table {
+    page-break-inside: auto !important;
+  }
+  
+  tr, td {
+    page-break-inside: avoid !important;
+  }
+  
+  thead {
+    display: table-header-group;
+  }
+  
+  img {
+    max-height: 190px !important;
+    max-width: 80% !important;
+    width: auto !important;
+    display: block;                
+    margin-left: auto !important;
+    margin-right: auto !important;
+  }
+  
+  table {
+    width: 100% !important;
+    margin-bottom: 4px !important;
+  }
+
+  th, td {
+    font-size: 8pt !important;
+    padding: 3px 3px !important;
+    line-height: 1.0 !important;
+    height: auto !important;
+  }
+  
+  caption, 
+  .table caption { 
+    font-size: 9pt !important; 
+    color: #bbbbbb !important;
+    padding-top: 2px !important;
+    padding-bottom: 2px !important;
+    margin-top: 2px !important;
+    margin-bottom: 5px !important;
+    text-align: center !important; 
+    caption-side: top !important;
+    display: table-caption !important;
+  }
+
+  caption *, 
+  .table caption * {
+    font-size: 9pt !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 1.1 !important;
+    color: #bbbbbb !important;
+  }
+
+  #TOC { display: none; }
+  }
+
+</style>
