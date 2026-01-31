@@ -9,8 +9,8 @@ L'obiettivo del lavoro è l'applicazione di un modello di **regressione logistic
 1.  **`GTianwen_Report.Rmd`**  
     Il codice sorgente in R Markdown contenente l'intera analisi.
 
-2.  **`GTianwen_Report.html`**  
-    Il report statistico finale in formato HTML (output del codice R), leggibile direttamente da browser.
+2.  **[`index.html`](https://richardboy05.github.io/Regressione-logistica-Valorant/)**  
+    Il report statistico finale in formato HTML (output del codice R), leggibile direttamente da browser al seguente [link](https://richardboy05.github.io/Regressione-logistica-Valorant/).
 
 3.  **`presentazione_gruppo_tianwen.pptx`**  
     Le slide PowerPoint utilizzate per l'esposizione del progetto.
